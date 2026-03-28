@@ -1,0 +1,12 @@
+PyMuPDF
+fastapi
+uvicorn
+python-multipart
+python-dotenv
+chromadb
+openai
+sentence-transformers
+supabase
+pydantic
+python-docx
+python-pptx
