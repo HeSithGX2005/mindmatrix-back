@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timezone
 import uuid
+import re
 from typing import Any
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Request
@@ -13,6 +14,7 @@ from schemas import (
     UploadAndChunkRequest,
     ChatRequest,
     QuizGenerationRequest,
+    QuizIdentityRequest,
     QuizSubmissionRequest,
     TopicsExtractionRequest,
 )
@@ -36,6 +38,119 @@ router = APIRouter()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client | None = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+UNKNOWN_MATERIAL_RESPONSE = "i don't know based on the provided material."
+_CONTINUE_INTENTS = {
+    "yes",
+    "continue",
+    "go on",
+    "next",
+    "more",
+    "proceed",
+    "go ahead",
+    "keep going",
+    "carry on",
+    "ok",
+    "okay",
+    "sure",
+}
+_FULL_LESSON_INTENTS = {
+    "full pdf",
+    "explain everything",
+    "teach everything",
+    "start lesson",
+    "start teaching",
+}
+
+
+def _is_unknown_material_answer(answer: str) -> bool:
+    return UNKNOWN_MATERIAL_RESPONSE in (answer or "").strip().lower()
+
+
+def _normalize_intent_text(text: str) -> str:
+    lowered = (text or "").lower().strip()
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered.strip(" .,!?:;\t\n\r")
+
+
+def _is_continue_intent(question: str) -> bool:
+    normalized = _normalize_intent_text(question)
+    if not normalized:
+        return False
+
+    if normalized in _CONTINUE_INTENTS:
+        return True
+
+    if len(normalized) <= 28 and re.fullmatch(
+        r"(?:please\s+)?(?:yes|continue|go on|next|more|proceed|go ahead|keep going|carry on|ok|okay|sure)(?:\s+please)?",
+        normalized,
+    ):
+        return True
+
+    return False
+
+
+def _is_full_lesson_intent(question: str) -> bool:
+    normalized = _normalize_intent_text(question)
+    if not normalized:
+        return False
+
+    if normalized in _FULL_LESSON_INTENTS:
+        return True
+
+    return any(phrase in normalized for phrase in _FULL_LESSON_INTENTS)
+
+
+def _build_history_text(history: list[dict[str, Any]], max_messages: int = 4) -> str:
+    history_text = ""
+    for msg in history[-max_messages:]:
+        role = str(msg.get("role", "user")).upper()
+        content = str(msg.get("content", ""))
+        history_text += f"{role}: {content}\\n"
+    return history_text
+
+
+def _fallback_answer_from_chunks(chunks: list[str]) -> str:
+    if not chunks:
+        return "I could not find enough detail in the uploaded material yet. Try asking about a specific topic or section."
+
+    def _clean_preview(chunk_text: str, max_len: int = 240) -> str:
+        cleaned = " ".join((chunk_text or "").split())
+        cleaned = re.sub(r"https?://\\S+|www\\.\\S+", "", cleaned)
+        cleaned = re.sub(r"\\b\\S+@\\S+\\b", "", cleaned)
+        cleaned = re.sub(r"\\s{2,}", " ", cleaned).strip(" -|•")
+        if len(cleaned) > max_len:
+            return f"{cleaned[:max_len].rstrip()}..."
+        return cleaned
+
+    previews: list[str] = []
+    for chunk in chunks[:3]:
+        cleaned = _clean_preview(chunk)
+        if not cleaned:
+            continue
+
+        sentences = re.split(r"(?<=[.!?])\\s+", cleaned)
+        selected = ""
+        for sentence in sentences:
+            candidate = sentence.strip()
+            if len(candidate) >= 45 and any(ch.isalpha() for ch in candidate):
+                selected = candidate
+                break
+
+        previews.append(selected or cleaned)
+        if len(previews) >= 2:
+            break
+
+    if not previews:
+        return "I found your uploaded material, but it appears to contain very little readable text. Try uploading a clearer version."
+
+    lines = [
+        "Here is a simpler explanation from your uploaded material:",
+    ]
+    for index, preview in enumerate(previews, start=1):
+        lines.append(f"{index}. {preview}")
+
+    lines.append("If you want, say continue and I will teach the next section in the same style.")
+    return "\n".join(lines)
 
 
 def _to_public_quiz_questions(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -98,8 +213,10 @@ def _persist_quiz_record(
             "end_index": selected_end_index,
             "questions": questions,
             "attempts": 0,
+            "is_finished": False,
             "last_score": None,
             "last_submitted_at": None,
+            "last_result": None,
             "created_at": now_iso,
             "updated_at": now_iso,
         }
@@ -272,14 +389,9 @@ async def teach(
                 detail="No uploaded material found for this session."
             )
         
-        question_lower = question.lower()
         total_chunks = len(session_documents)
-
-        continue_triggers = ["yes", "continue", "go on", "next"]
-        full_triggers = ["full pdf", "explain everything"]
-
-        is_continue = any(word in question_lower for word in continue_triggers)
-        is_full = any(word in question_lower for word in full_triggers)
+        is_continue = _is_continue_intent(question)
+        is_full = _is_full_lesson_intent(question)
 
         if is_full:
             session["mode"] = "teach"
@@ -291,15 +403,17 @@ async def teach(
             batch = session_documents[start:end]
             session["current_index"] = end
 
-            history_text = ""
-            for msg in session["history"][-4:]:
-                history_text += f"{msg['role'].upper()}: {msg['content']}\\n"
+            history_text = _build_history_text(session["history"])
 
             answer = answer_from_chunks_with_history(
                 batch,
                 question,
                 history_text
             )
+
+            is_unknown_answer = _is_unknown_material_answer(answer)
+            if is_unknown_answer:
+                answer = _fallback_answer_from_chunks(batch)
 
             if end < total_chunks:
                 answer += "\n\nWould you like me to continue to the next section?"
@@ -346,15 +460,17 @@ async def teach(
             batch = session_documents[start:end]
             session["current_index"] = end
 
-            history_text = ""
-            for msg in session["history"][-4:]:
-                history_text += f"{msg['role'].upper()}: {msg['content']}\\n"
+            history_text = _build_history_text(session["history"])
 
             answer = answer_from_chunks_with_history(
                 batch,
                 question,
                 history_text
             )
+
+            is_unknown_answer = _is_unknown_material_answer(answer)
+            if is_unknown_answer:
+                answer = _fallback_answer_from_chunks(batch)
 
             if end < total_chunks:
                 answer += "\n\nWould you like me to continue to the next section?"
@@ -383,15 +499,20 @@ async def teach(
             k=3
         )
 
-        history_text = ""
-        for msg in session["history"][-4:]:
-            history_text += f"{msg['role'].upper()}: {msg['content']}\\n"
+        if not retrieved_chunks:
+            # Fallback to first material chunks so users can still learn when similarity retrieval misses.
+            retrieved_chunks = session_documents[:3]
+
+        history_text = _build_history_text(session["history"])
 
         answer = answer_from_chunks_with_history(
             retrieved_chunks,
             question,
             history_text
         )
+
+        if _is_unknown_material_answer(answer):
+            answer = _fallback_answer_from_chunks(retrieved_chunks)
 
         session["history"].append({"role": "user", "content": question})
         session["history"].append({"role": "assistant", "content": answer})
@@ -433,7 +554,7 @@ async def generate_quiz(
         selected_chunks = chunks
         selected_start_index = 0
         selected_end_index = len(chunks) - 1
-        selected_topic_ids = data.get("topic_ids") or []
+        selected_topic_ids = data.topic_ids or []
 
         if scope == "parts":
             if isinstance(selected_topic_ids, list) and len(selected_topic_ids) > 0:
@@ -463,8 +584,8 @@ async def generate_quiz(
                     selected_start_index = deduped_indexes[0]
                     selected_end_index = deduped_indexes[-1]
             else:
-                start_index = int(data.get("start_index") if data.get("start_index") is not None else 0)
-                end_index = int(data.get("end_index") if data.get("end_index") is not None else start_index + 4)
+                start_index = int(data.start_index) if data.start_index is not None else 0
+                end_index = int(data.end_index) if data.end_index is not None else start_index + 4
 
                 if end_index < start_index:
                     start_index, end_index = end_index, start_index
@@ -505,8 +626,10 @@ async def generate_quiz(
             "end_index": selected_end_index,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "attempts": 0,
+            "is_finished": False,
             "last_score": None,
             "last_submitted_at": None,
+            "last_result": None,
         }
 
         _persist_quiz_record(
@@ -558,7 +681,7 @@ async def quiz_history(
                 response = (
                     supabase
                     .table("project_quizzes")
-                    .select("quiz_id, session_id, scope, difficulty, question_count, start_index, end_index, created_at, attempts, last_score, last_submitted_at")
+                    .select("quiz_id, session_id, scope, difficulty, question_count, start_index, end_index, created_at, attempts, is_finished, last_score, last_submitted_at")
                     .eq("session_id", session_id)
                     .order("created_at", desc=True)
                     .execute()
@@ -577,6 +700,7 @@ async def quiz_history(
                         },
                         "created_at": row.get("created_at"),
                         "attempts": int(row.get("attempts", 0)),
+                        "is_finished": bool(row.get("is_finished", False)),
                         "last_score": row.get("last_score"),
                         "last_submitted_at": row.get("last_submitted_at"),
                     }
@@ -602,6 +726,7 @@ async def quiz_history(
                     },
                     "created_at": quiz_data.get("created_at"),
                     "attempts": int(quiz_data.get("attempts", 0)),
+                    "is_finished": bool(quiz_data.get("is_finished", False)),
                     "last_score": quiz_data.get("last_score"),
                     "last_submitted_at": quiz_data.get("last_submitted_at"),
                 })
@@ -620,7 +745,7 @@ async def quiz_history(
 
 @router.post("/quiz/run")
 async def quiz_run(
-    data: QuizSubmissionRequest,
+    data: QuizIdentityRequest,
     user_data: dict = Depends(verify_jwt_token)
 ):
     """Return a previously generated quiz so learners can retake it."""
@@ -653,7 +778,50 @@ async def quiz_run(
                 "start_index": int(quiz_data.get("start_index", 0)),
                 "end_index": int(quiz_data.get("end_index", 0)),
             },
+            "is_finished": bool(quiz_data.get("is_finished", False)),
+            "last_score": quiz_data.get("last_score"),
+            "last_submitted_at": quiz_data.get("last_submitted_at"),
             "questions": public_questions,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/quiz/result")
+async def quiz_result(
+    data: QuizIdentityRequest,
+    user_data: dict = Depends(verify_jwt_token)
+):
+    """Return the latest submitted result for a quiz."""
+    try:
+        await verify_session_ownership(user_data, data.session_id)
+
+        session_id = data.session_id
+        quiz_id = data.quiz_id
+
+        quiz_data = _get_persisted_quiz(session_id, quiz_id)
+        if not quiz_data:
+            session = chat_sessions.get(session_id) or {}
+            quizzes = session.get("quizzes") or {}
+            quiz_data = quizzes.get(quiz_id)
+
+        if not quiz_data:
+            raise HTTPException(status_code=404, detail="Quiz not found")
+
+        last_result = quiz_data.get("last_result")
+        if not isinstance(last_result, dict):
+            raise HTTPException(status_code=404, detail="No submitted result found for this quiz")
+
+        return {
+            "quiz_id": quiz_id,
+            "session_id": session_id,
+            "is_finished": bool(quiz_data.get("is_finished", False)),
+            "attempts": int(quiz_data.get("attempts", 0)),
+            "last_score": quiz_data.get("last_score"),
+            "last_submitted_at": quiz_data.get("last_submitted_at"),
+            "result": last_result,
         }
     except HTTPException:
         raise
@@ -663,7 +831,7 @@ async def quiz_run(
 
 @router.post("/quiz/delete")
 async def delete_quiz(
-    data: QuizSubmissionRequest,
+    data: QuizIdentityRequest,
     user_data: dict = Depends(verify_jwt_token)
 ):
     """Delete a previously generated quiz from a session."""
@@ -773,15 +941,19 @@ async def submit_quiz(
 
         if memory_quiz_data:
             memory_quiz_data["attempts"] = next_attempts
+            memory_quiz_data["is_finished"] = True
             memory_quiz_data["last_score"] = results.get("score")
             memory_quiz_data["last_submitted_at"] = submitted_at
+            memory_quiz_data["last_result"] = results
 
         if supabase:
             try:
                 supabase.table("project_quizzes").update({
                     "attempts": next_attempts,
+                    "is_finished": True,
                     "last_score": results.get("score"),
                     "last_submitted_at": submitted_at,
+                    "last_result": results,
                     "updated_at": submitted_at,
                 }).eq("session_id", session_id).eq("quiz_id", quiz_id).execute()
             except Exception as exc:

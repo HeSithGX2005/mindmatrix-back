@@ -60,6 +60,64 @@ def _first_sentence(text: str) -> str:
     return _clean_text_preview(sentence, max_len=180)
 
 
+def _is_low_signal_follow_up(question: str) -> bool:
+    normalized = " ".join((question or "").split()).lower().strip(" .,!?:;\t\n\r")
+    if not normalized:
+        return False
+
+    low_signal_prompts = {
+        "yes",
+        "continue",
+        "go on",
+        "next",
+        "go ahead",
+        "more",
+        "proceed",
+        "ok",
+        "okay",
+        "sure",
+        "full pdf",
+        "explain everything",
+        "keep going",
+    }
+
+    if normalized in low_signal_prompts:
+        return True
+
+    if len(normalized) <= 28 and re.fullmatch(
+        r"(?:please\s+)?(?:yes|continue|go on|next|more|proceed|go ahead|ok|okay|sure|keep going)(?:\s+please)?",
+        normalized,
+    ):
+        return True
+
+    return False
+
+
+def _postprocess_tutor_answer(answer: str) -> str:
+    if not answer:
+        return ""
+
+    lines = [line.rstrip() for line in answer.replace("\r\n", "\n").split("\n")]
+    cleaned_lines: list[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            cleaned_lines.append("")
+            continue
+
+        # Drop pure URL lines; they add noise in the chat experience.
+        if re.fullmatch(r"(?:https?://|www\\.)\\S+", stripped):
+            continue
+
+        cleaned_lines.append(line)
+
+    cleaned = "\n".join(cleaned_lines).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned
+
+
 def _extract_json_array(raw_content: str) -> list:
     if not raw_content:
         return []
@@ -545,10 +603,12 @@ def grade_quiz_submission(
         result_rows.append(row)
 
         if not is_correct:
+            question_text = str(question.get("question", "")).strip()
+            user_answer_text = str(normalized_user_answer).strip()
             wrong_answers.append({
                 "id": question_id,
                 "question_type": question_type,
-                "question": question.get("question", ""),
+                "question": question_text,
                 "your_answer": normalized_user_answer,
                 "correct_option": correct_option,
                 "correct_options": correct_options,
@@ -563,7 +623,14 @@ def grade_quiz_submission(
                 "chunk_preview": question.get("chunk_preview", ""),
                 "learn_again": {
                     "chunk_index": question.get("chunk_index", 0),
-                    "label": "Learn this part again"
+                    "label": "Learn this part again",
+                    "displayed_question": question_text,
+                    "prompt": (
+                        "Please reteach this exact quiz question and explain why the previous answer was wrong.\n"
+                        f"Question: {question_text}\n"
+                        f"Student answer: {user_answer_text or 'Not answered'}\n"
+                        "Explain clearly in simple language, then give one quick follow-up check question."
+                    ),
                 }
             })
 
@@ -589,16 +656,45 @@ def answer_from_chunks_with_history(
     if not chunks:
         return "I don't know based on the provided material."
 
+    normalized_question = " ".join((question or "").split())
+    is_guided_teach_turn = _is_low_signal_follow_up(normalized_question)
+    if is_guided_teach_turn:
+        normalized_question = (
+            "Teach this section as the next lesson segment. Explain key ideas in simple steps, "
+            "ignore raw links/reference noise, and end with one quick recap question."
+        )
+
     context = "\n\n".join(chunks)
+
+    response_style = (
+        "Write like a human tutor in a natural, conversational voice.\n"
+        "Do not force a fixed template every time.\n"
+        "Pick the best format for the question (short paragraph, bullets, or mixed).\n"
+        "Keep it clear, friendly, and practical, with simple wording.\n"
+        "Use examples when useful, but keep them brief and relatable.\n"
+        "Avoid raw URLs, file names, chunk IDs, and long copied text."
+    )
+
+    if is_guided_teach_turn:
+        response_style = (
+            "Teach this as the next lesson in a smooth, engaging way.\n"
+            "Start with the core idea, then explain important points step by step.\n"
+            "Include a quick example and a short check question near the end.\n"
+            "Keep the tone warm and encouraging, not robotic.\n"
+            "Do not include raw links, source lists, or noisy references."
+        )
 
     prompt = f"""
 You are an AI tutor.
 
 Use the lecture context as the SOURCE OF TRUTH.
-Use the conversation history only to understand how to respond.
+Use the conversation history only to adapt tone and continuity.
 
-If the answer is not in the lecture context, say:
+If the answer is not in the lecture context, say exactly:
 "I don't know based on the provided material."
+
+Writing rules:
+{response_style}
 
 --- LECTURE CONTEXT ---
 {context}
@@ -607,7 +703,7 @@ If the answer is not in the lecture context, say:
 {history}
 
 Current question:
-{question}
+{normalized_question}
 """
 
     try:
@@ -615,16 +711,22 @@ Current question:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an expert AI tutor who explains concepts clearly step-by-step."
+                    "content": (
+                        "You are an expert tutor who sounds natural, warm, and human. "
+                        "Explain clearly without sounding scripted. "
+                        "Vary sentence flow and keep responses easy to understand."
+                    )
                 },
                 {
                     "role": "user",
                     "content": prompt
                 }
             ],
-            temperature=1,
+            temperature=0.7,
         )
-        return response.choices[0].message.content
+        raw_answer = response.choices[0].message.content or ""
+        polished = _postprocess_tutor_answer(raw_answer)
+        return polished or "I don't know based on the provided material."
     except RateLimitError:
         return (
             "I hit a temporary rate limit from the model provider. "
